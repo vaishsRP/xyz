@@ -1,6 +1,6 @@
 # Dynamic Discounting and Self-Control Simulation
 
-A small research-style behavioral economics project modeling intertemporal choice under:
+A lightweight behavioral economics project that simulates intertemporal choice under:
 
 - Exponential discounting
 - Quasi-hyperbolic (β–δ) discounting
@@ -9,9 +9,9 @@ It demonstrates preference reversals and evaluates commitment devices.
 
 ## Project structure
 
-- `data/intertemporal_choices.csv` — intertemporal choice menu with immediate and future scenarios.
-- `src/dynamic_discounting_simulation.py` — modular simulation, analysis, and plotting pipeline.
-- `outputs/` — generated report + metrics (+ plots if matplotlib is available).
+- `data/intertemporal_choices.csv`: choice menu with SS/LL rewards and delays (immediate and future scenarios).
+- `src/dynamic_discounting_simulation.py`: modular simulation + analysis pipeline.
+- `outputs/`: generated figures, metrics, and markdown report.
 
 ## Run
 
@@ -19,19 +19,12 @@ It demonstrates preference reversals and evaluates commitment devices.
 python src/dynamic_discounting_simulation.py
 ```
 
-## Notes on dependencies
+## Outputs
 
-- The simulation and CSV outputs run with Python standard library only.
-- Plot generation uses `matplotlib` when available.
-- In restricted environments without `matplotlib`, the script still completes and writes all analysis CSVs and report.
+After running, inspect:
 
-## Expected outputs
-
-- `outputs/beta_sweep_metrics.csv`
-- `outputs/reversal_region_metrics.csv`
-- `outputs/welfare_comparison.csv`
+- `outputs/discount_curves.png`
+- `outputs/beta_sweep_outcomes.png`
+- `outputs/reversal_region_heatmap.png`
 - `outputs/report.md`
-- Plot files (if matplotlib is installed):
-  - `outputs/discount_curves.png`
-  - `outputs/beta_sweep_outcomes.png`
-  - `outputs/reversal_region_heatmap.png`
+

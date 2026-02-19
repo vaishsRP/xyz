@@ -1,216 +1,162 @@
-"""Dynamic discounting simulation for present bias and commitment.
-
-This implementation is intentionally lightweight and dependency-minimal:
-- Core simulation/analysis uses Python standard library only.
-- Plotting uses matplotlib if available; otherwise plot generation is skipped gracefully.
-"""
+"""Simulation project for dynamic discounting, present bias, and commitment."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import csv
-import math
-import random
-from statistics import mean
 
-try:
-    import matplotlib.pyplot as plt  # type: ignore
-except Exception:  # matplotlib not available in restricted environments
-    plt = None
-
-
-@dataclass(frozen=True)
-class ChoiceItem:
-    """A single SS-LL intertemporal choice item."""
-
-    item_id: int
-    ss_amount: float
-    ll_amount: float
-    ss_delay_days: int
-    ll_delay_days: int
-    scenario: str
-    source: str
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 
 @dataclass(frozen=True)
 class ModelParams:
-    """Discounting parameters for the agent."""
+    """Container for discounting parameters."""
 
     beta: float
     delta: float
     risk_aversion: float = 1.0
 
 
-def utility(amount: float, gamma: float = 1.0) -> float:
-    """CRRA utility; gamma=1.0 yields linear utility."""
+def utility(amount: np.ndarray | float, gamma: float = 1.0) -> np.ndarray | float:
+    """CRRA utility with gamma=1 interpreted as linear utility."""
+    amount = np.asarray(amount)
     if gamma == 1.0:
         return amount
-    return (amount ** (1 - gamma)) / (1 - gamma)
+    return np.power(amount, 1 - gamma) / (1 - gamma)
 
 
-def exp_discount(delay_days: int, delta: float) -> float:
-    """Exponential discount factor."""
-    return delta**delay_days
+def exp_discount(delay_days: np.ndarray | float, delta: float) -> np.ndarray | float:
+    """Exponential discount factor using daily delay and daily delta."""
+    return np.power(delta, np.asarray(delay_days))
 
 
-def qh_discount(delay_days: int, beta: float, delta: float) -> float:
+def qh_discount(delay_days: np.ndarray | float, beta: float, delta: float) -> np.ndarray | float:
     """Quasi-hyperbolic (beta-delta) discount factor."""
-    if delay_days == 0:
-        return 1.0
-    return beta * (delta**delay_days)
+    delay = np.asarray(delay_days)
+    return np.where(delay == 0, 1.0, beta * np.power(delta, delay))
 
 
-def discounted_utility(amount: float, delay_days: int, params: ModelParams, model: str) -> float:
-    """Discounted utility under selected model."""
+def discounted_utility(amount: np.ndarray, delay: np.ndarray, params: ModelParams, model: str) -> np.ndarray:
+    """Compute discounted utility under exponential or quasi-hyperbolic discounting."""
     base_u = utility(amount, params.risk_aversion)
     if model == "exponential":
-        return exp_discount(delay_days, params.delta) * base_u
-    if model == "beta_delta":
-        return qh_discount(delay_days, params.beta, params.delta) * base_u
-    raise ValueError("model must be 'exponential' or 'beta_delta'")
+        discount = exp_discount(delay, params.delta)
+    elif model == "beta_delta":
+        discount = qh_discount(delay, params.beta, params.delta)
+    else:
+        raise ValueError("model must be 'exponential' or 'beta_delta'")
+    return discount * base_u
 
 
-def read_dataset(path: Path) -> list[ChoiceItem]:
-    """Read the intertemporal choice dataset from CSV."""
-    items: list[ChoiceItem] = []
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            items.append(
-                ChoiceItem(
-                    item_id=int(row["item_id"]),
-                    ss_amount=float(row["ss_amount"]),
-                    ll_amount=float(row["ll_amount"]),
-                    ss_delay_days=int(row["ss_delay_days"]),
-                    ll_delay_days=int(row["ll_delay_days"]),
-                    scenario=row["scenario"],
-                    source=row["source"],
-                )
-            )
-    return items
+def evaluate_choices(df: pd.DataFrame, params: ModelParams, model: str, decision_time: int) -> pd.DataFrame:
+    """Evaluate SS-vs-LL choices at a specific decision time."""
+    out = df.copy()
+    ss_remaining = np.maximum(out["ss_delay_days"].to_numpy() - decision_time, 0)
+    ll_remaining = np.maximum(out["ll_delay_days"].to_numpy() - decision_time, 0)
+
+    ss_v = discounted_utility(out["ss_amount"].to_numpy(), ss_remaining, params, model)
+    ll_v = discounted_utility(out["ll_amount"].to_numpy(), ll_remaining, params, model)
+
+    out["decision_time"] = decision_time
+    out["ss_value"] = ss_v
+    out["ll_value"] = ll_v
+    out["choice"] = np.where(ll_v >= ss_v, "LL", "SS")
+    return out
 
 
-def evaluate_choice(item: ChoiceItem, params: ModelParams, model: str, decision_time: int) -> dict:
-    """Evaluate one item's SS-vs-LL choice at a given decision time."""
-    ss_remaining = max(item.ss_delay_days - decision_time, 0)
-    ll_remaining = max(item.ll_delay_days - decision_time, 0)
-
-    ss_v = discounted_utility(item.ss_amount, ss_remaining, params, model)
-    ll_v = discounted_utility(item.ll_amount, ll_remaining, params, model)
-
-    return {
-        "item_id": item.item_id,
-        "scenario": item.scenario,
-        "decision_time": decision_time,
-        "ss_value": ss_v,
-        "ll_value": ll_v,
-        "choice": "LL" if ll_v >= ss_v else "SS",
-    }
-
-
-def detect_preference_reversal(items: list[ChoiceItem], params: ModelParams, model: str) -> list[dict]:
-    """Detect reversals: LL at t=0 then SS when SS becomes immediate."""
-    results: list[dict] = []
-    for item in items:
-        early = evaluate_choice(item, params, model, decision_time=0)
-        late = evaluate_choice(item, params, model, decision_time=item.ss_delay_days)
-        reversal = early["choice"] == "LL" and late["choice"] == "SS"
-        results.append(
+def detect_preference_reversal(df: pd.DataFrame, params: ModelParams, model: str) -> pd.DataFrame:
+    """Detect reversal comparing choices at t=0 and when SS becomes immediate."""
+    early = evaluate_choices(df, params, model, decision_time=0).set_index("item_id")
+    rows = []
+    for _, row in df.iterrows():
+        t_switch = int(row["ss_delay_days"])
+        late = evaluate_choices(pd.DataFrame([row]), params, model, decision_time=t_switch).iloc[0]
+        initial_choice = early.loc[row["item_id"], "choice"]
+        reversal = (initial_choice == "LL") and (late["choice"] == "SS")
+        rows.append(
             {
-                "item_id": item.item_id,
-                "scenario": item.scenario,
-                "initial_choice": early["choice"],
+                "item_id": row["item_id"],
+                "scenario": row["scenario"],
+                "initial_choice": initial_choice,
                 "later_choice": late["choice"],
                 "reversal": reversal,
             }
         )
-    return results
+    return pd.DataFrame(rows)
 
 
-def commitment_welfare(items: list[ChoiceItem], params: ModelParams) -> list[dict]:
-    """Compare realized utility with and without commitment (beta-delta behavior)."""
-    out: list[dict] = []
-    for item in items:
-        initial = evaluate_choice(item, params, "beta_delta", decision_time=0)
-        late = evaluate_choice(item, params, "beta_delta", decision_time=item.ss_delay_days)
+def commitment_welfare(df: pd.DataFrame, params: ModelParams) -> pd.DataFrame:
+    """Compare realized utility with and without a commitment device under beta-delta preferences."""
+    records = []
+    initial = evaluate_choices(df, params, model="beta_delta", decision_time=0).set_index("item_id")
+    for _, row in df.iterrows():
+        item = int(row["item_id"])
+        t_switch = int(row["ss_delay_days"])
+        later = evaluate_choices(pd.DataFrame([row]), params, model="beta_delta", decision_time=t_switch).iloc[0]
 
-        no_commit_choice = late["choice"]
-        with_commit_choice = initial["choice"]
+        no_commit_choice = later["choice"]
+        with_commit_choice = initial.loc[item, "choice"]
 
-        no_commit_amount = item.ll_amount if no_commit_choice == "LL" else item.ss_amount
-        with_commit_amount = item.ll_amount if with_commit_choice == "LL" else item.ss_amount
+        no_commit_payoff = row["ll_amount"] if no_commit_choice == "LL" else row["ss_amount"]
+        commit_payoff = row["ll_amount"] if with_commit_choice == "LL" else row["ss_amount"]
 
-        no_commit_u = utility(no_commit_amount, params.risk_aversion)
-        with_commit_u = utility(with_commit_amount, params.risk_aversion)
-
-        out.append(
+        records.append(
             {
-                "item_id": item.item_id,
-                "scenario": item.scenario,
+                "item_id": item,
+                "scenario": row["scenario"],
                 "no_commit_choice": no_commit_choice,
                 "with_commit_choice": with_commit_choice,
-                "no_commit_realized_u": no_commit_u,
-                "commit_realized_u": with_commit_u,
-                "welfare_gain_commitment": with_commit_u - no_commit_u,
+                "no_commit_realized_u": utility(no_commit_payoff, params.risk_aversion),
+                "commit_realized_u": utility(commit_payoff, params.risk_aversion),
             }
         )
+    out = pd.DataFrame(records)
+    out["welfare_gain_commitment"] = out["commit_realized_u"] - out["no_commit_realized_u"]
     return out
 
 
-def sweep_beta(items: list[ChoiceItem], delta: float, beta_grid: list[float]) -> list[dict]:
-    """Sweep beta while holding delta fixed."""
-    rows: list[dict] = []
+def sweep_beta(df: pd.DataFrame, delta: float, beta_grid: np.ndarray) -> pd.DataFrame:
+    """Sweep beta and track reversal rates and average welfare gains from commitment."""
+    rows = []
     for beta in beta_grid:
         params = ModelParams(beta=beta, delta=delta)
-        rev = detect_preference_reversal(items, params, "beta_delta")
-        welfare = commitment_welfare(items, params)
+        rev = detect_preference_reversal(df, params, "beta_delta")
+        welfare = commitment_welfare(df, params)
         rows.append(
             {
                 "beta": beta,
-                "reversal_rate": mean(1.0 if r["reversal"] else 0.0 for r in rev),
-                "avg_welfare_gain": mean(w["welfare_gain_commitment"] for w in welfare),
+                "reversal_rate": rev["reversal"].mean(),
+                "avg_welfare_gain": welfare["welfare_gain_commitment"].mean(),
             }
         )
-    return rows
+    return pd.DataFrame(rows)
 
 
-def reversal_region(items: list[ChoiceItem], beta_grid: list[float], delta_grid: list[float]) -> list[dict]:
-    """Compute reversal region in beta-delta parameter space."""
-    rows: list[dict] = []
+def reversal_region(df: pd.DataFrame, beta_grid: np.ndarray, delta_grid: np.ndarray) -> pd.DataFrame:
+    """Map parameter pairs where at least one reversal occurs."""
+    rows = []
     for beta in beta_grid:
         for delta in delta_grid:
             params = ModelParams(beta=beta, delta=delta)
-            rev = detect_preference_reversal(items, params, "beta_delta")
-            share = mean(1.0 if r["reversal"] else 0.0 for r in rev)
+            rev = detect_preference_reversal(df, params, "beta_delta")
             rows.append(
                 {
                     "beta": beta,
                     "delta": delta,
-                    "has_reversal": int(share > 0),
-                    "reversal_share": share,
+                    "has_reversal": int(rev["reversal"].any()),
+                    "reversal_share": rev["reversal"].mean(),
                 }
             )
-    return rows
+    return pd.DataFrame(rows)
 
 
-def write_csv(path: Path, rows: list[dict]) -> None:
-    """Write rows to CSV."""
-    if not rows:
-        return
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def plot_discount_curves(output_dir: Path, beta: float, delta: float) -> bool:
-    """Create discount curve plot if matplotlib exists."""
-    if plt is None:
-        return False
-    t = list(range(0, 181))
-    exp_curve = [exp_discount(x, delta) for x in t]
-    qh_curve = [qh_discount(x, beta, delta) for x in t]
+def plot_discount_curves(output_dir: Path, beta: float, delta: float) -> None:
+    """Plot discount-factor curves."""
+    t = np.arange(0, 181)
+    exp_curve = exp_discount(t, delta)
+    qh_curve = qh_discount(t, beta, delta)
 
     fig, ax = plt.subplots(figsize=(8, 4.8))
     ax.plot(t, exp_curve, label=f"Exponential (δ={delta:.3f})", linewidth=2)
@@ -223,25 +169,19 @@ def plot_discount_curves(output_dir: Path, beta: float, delta: float) -> bool:
     fig.tight_layout()
     fig.savefig(output_dir / "discount_curves.png", dpi=160)
     plt.close(fig)
-    return True
 
 
-def plot_beta_sweep(output_dir: Path, sweep_rows: list[dict]) -> bool:
-    """Plot reversal rate and welfare gain vs beta."""
-    if plt is None:
-        return False
-    betas = [r["beta"] for r in sweep_rows]
-    reversal_rates = [r["reversal_rate"] for r in sweep_rows]
-    welfare_gains = [r["avg_welfare_gain"] for r in sweep_rows]
-
+def plot_beta_sweep(output_dir: Path, sweep_df: pd.DataFrame) -> None:
+    """Plot reversal rates and welfare effects versus beta."""
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
-    axes[0].plot(betas, reversal_rates, color="tab:red", linewidth=2)
+
+    axes[0].plot(sweep_df["beta"], sweep_df["reversal_rate"], color="tab:red", linewidth=2)
     axes[0].set_title("Preference Reversals vs β")
     axes[0].set_xlabel("β")
     axes[0].set_ylabel("Reversal rate")
     axes[0].grid(alpha=0.25)
 
-    axes[1].plot(betas, welfare_gains, color="tab:blue", linewidth=2)
+    axes[1].plot(sweep_df["beta"], sweep_df["avg_welfare_gain"], color="tab:blue", linewidth=2)
     axes[1].axhline(0, color="black", linewidth=1)
     axes[1].set_title("Commitment Welfare Gain vs β")
     axes[1].set_xlabel("β")
@@ -251,28 +191,18 @@ def plot_beta_sweep(output_dir: Path, sweep_rows: list[dict]) -> bool:
     fig.tight_layout()
     fig.savefig(output_dir / "beta_sweep_outcomes.png", dpi=160)
     plt.close(fig)
-    return True
 
 
-def plot_reversal_region(output_dir: Path, region_rows: list[dict], beta_grid: list[float], delta_grid: list[float]) -> bool:
-    """Plot heatmap of reversal share in parameter space."""
-    if plt is None:
-        return False
-
-    matrix: list[list[float]] = []
-    for delta in sorted(delta_grid, reverse=True):
-        row = []
-        for beta in beta_grid:
-            match = next(r for r in region_rows if math.isclose(r["beta"], beta) and math.isclose(r["delta"], delta))
-            row.append(match["reversal_share"])
-        matrix.append(row)
+def plot_reversal_region(output_dir: Path, region_df: pd.DataFrame, beta_grid: np.ndarray, delta_grid: np.ndarray) -> None:
+    """Plot parameter region where preference reversals occur."""
+    pivot = region_df.pivot(index="delta", columns="beta", values="reversal_share").sort_index(ascending=False)
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    im = ax.imshow(matrix, aspect="auto", cmap="magma", vmin=0, vmax=1)
-    ax.set_xticks(range(len(beta_grid)))
+    im = ax.imshow(pivot.values, aspect="auto", cmap="magma", vmin=0, vmax=1)
+    ax.set_xticks(np.arange(len(beta_grid)))
     ax.set_xticklabels([f"{b:.2f}" for b in beta_grid], rotation=45)
-    ax.set_yticks(range(len(delta_grid)))
-    ax.set_yticklabels([f"{d:.3f}" for d in sorted(delta_grid, reverse=True)])
+    ax.set_yticks(np.arange(len(delta_grid)))
+    ax.set_yticklabels([f"{d:.3f}" for d in delta_grid[::-1]])
     ax.set_xlabel("β")
     ax.set_ylabel("δ")
     ax.set_title("Reversal Share in Parameter Space")
@@ -281,78 +211,69 @@ def plot_reversal_region(output_dir: Path, region_rows: list[dict], beta_grid: l
     fig.tight_layout()
     fig.savefig(output_dir / "reversal_region_heatmap.png", dpi=160)
     plt.close(fig)
-    return True
 
 
-def generate_report(output_dir: Path, params: ModelParams, sweep_rows: list[dict], welfare_rows: list[dict], plots_generated: bool) -> None:
-    """Write structured markdown interpretation report."""
-    avg_gain = mean(r["welfare_gain_commitment"] for r in welfare_rows)
-    gain_share = mean(1.0 if r["welfare_gain_commitment"] > 0 else 0.0 for r in welfare_rows)
-    peak = max(sweep_rows, key=lambda r: r["reversal_rate"])
+def generate_report(output_dir: Path, params: ModelParams, sweep_df: pd.DataFrame, welfare_df: pd.DataFrame) -> None:
+    """Create structured markdown report with interpretation."""
+    avg_gain = welfare_df["welfare_gain_commitment"].mean()
+    gain_share = (welfare_df["welfare_gain_commitment"] > 0).mean()
+    peak_rev = sweep_df.loc[sweep_df["reversal_rate"].idxmax(), ["beta", "reversal_rate"]]
 
-    plot_status = "generated" if plots_generated else "not generated (matplotlib unavailable in this environment)"
-
-    report = f"""# Dynamic Discounting and Self-Control: A Simulation of Present Bias and Commitment
+    report = f"""# Dynamic Discounting and Self-Control
 
 ## 1) Dynamic inconsistency
-Under exponential discounting, relative preferences are time-consistent when both options are shifted forward together.
-Under quasi-hyperbolic discounting, \\(\\beta < 1\\) creates present bias: delayed outcomes get an extra short-run penalty, so planned choices can differ from later choices.
+Under exponential discounting, relative preferences between two dated options depend only on the time gap, so plans are time-consistent. Under quasi-hyperbolic discounting, \(\beta < 1\) creates an extra penalty on all delayed outcomes, making the immediate period special and generating a mismatch between earlier plans and later actions.
 
-## 2) Why preference reversals emerge
-Preference reversals occur when LL is chosen at planning (t=0) but SS is chosen later when SS becomes immediate.
-This happens because the immediate period receives special weight under β–δ preferences.
-In this run (δ={params.delta:.3f}), the highest reversal rate appears around β={peak['beta']:.2f} with reversal rate {peak['reversal_rate']:.2%}.
+## 2) Why preference reversals emerge with present bias
+In the simulation, many agents choose Larger–Later (LL) at the planning date but switch to Smaller–Sooner (SS) when SS becomes immediate. The reversal mechanism is the present-bias wedge: once "now" arrives, delayed utility is multiplied by \(\beta\), reducing LL's attractiveness. Reversal prevalence peaks at β={peak_rev['beta']:.2f} with a reversal rate of {peak_rev['reversal_rate']:.2%} (δ fixed at {params.delta:.3f}).
 
-## 3) Commitment devices
-A commitment device forces execution of the initial plan and blocks later switching.
-Average realized utility gain from commitment is {avg_gain:.2f}, with positive gains in {gain_share:.1%} of items.
-Economically, commitment protects long-run welfare from short-run temptation.
-Psychologically, it externalizes self-control.
+## 3) Commitment devices: economic and psychological interpretation
+A commitment device locks in the ex-ante LL plan and blocks later switching. In this run, average realized utility gain from commitment is {avg_gain:.2f}, and commitment strictly improves outcomes in {gain_share:.1%} of choice items. Economically, commitment mitigates self-control costs. Psychologically, it acts as a pre-commitment strategy that protects long-run goals from short-run temptation.
 
 ## 4) Real-world parallels
-- Savings and retirement lock-ins.
-- Subscription prepayment and cancellation frictions.
-- Penalty-backed commitment contracts.
-- App blockers or spending controls for digital self-regulation.
+- **Savings and retirement:** automatic enrollment and withdrawal penalties prevent impulsive present spending.
+- **Subscriptions and prepayment:** paying upfront for a gym or class raises follow-through.
+- **Deadlines and penalties:** commitment contracts convert intentions into enforceable actions.
+- **Digital self-control:** app blockers and spending locks reduce immediate temptation.
 
-## 5) Output artifacts
+## 5) Artifacts
+- `outputs/discount_curves.png`
+- `outputs/beta_sweep_outcomes.png`
+- `outputs/reversal_region_heatmap.png`
 - `outputs/beta_sweep_metrics.csv`
-- `outputs/reversal_region_metrics.csv`
 - `outputs/welfare_comparison.csv`
-- Plots status: **{plot_status}**
 """
-    (output_dir / "report.md").write_text(report, encoding="utf-8")
+    (output_dir / "report.md").write_text(report)
 
 
 def main() -> None:
-    """Run full simulation pipeline."""
-    random.seed(42)
+    """Run project pipeline end-to-end."""
+    np.random.seed(42)
 
     root = Path(__file__).resolve().parents[1]
     data_path = root / "data" / "intertemporal_choices.csv"
     output_dir = root / "outputs"
     output_dir.mkdir(exist_ok=True)
 
-    items = read_dataset(data_path)
+    df = pd.read_csv(data_path)
+
     baseline_params = ModelParams(beta=0.72, delta=0.995)
 
-    beta_grid = [0.40 + 0.02 * i for i in range(31)]
-    delta_grid = [0.985 + 0.001 * i for i in range(15)]
+    beta_grid = np.linspace(0.4, 1.0, 31)
+    delta_grid = np.linspace(0.985, 0.999, 15)
 
-    sweep_rows = sweep_beta(items, delta=baseline_params.delta, beta_grid=beta_grid)
-    region_rows = reversal_region(items, beta_grid=beta_grid, delta_grid=delta_grid)
-    welfare_rows = commitment_welfare(items, baseline_params)
+    sweep_df = sweep_beta(df, delta=baseline_params.delta, beta_grid=beta_grid)
+    region_df = reversal_region(df, beta_grid=beta_grid, delta_grid=delta_grid)
+    welfare_df = commitment_welfare(df, baseline_params)
 
-    write_csv(output_dir / "beta_sweep_metrics.csv", sweep_rows)
-    write_csv(output_dir / "reversal_region_metrics.csv", region_rows)
-    write_csv(output_dir / "welfare_comparison.csv", welfare_rows)
+    sweep_df.to_csv(output_dir / "beta_sweep_metrics.csv", index=False)
+    region_df.to_csv(output_dir / "reversal_region_metrics.csv", index=False)
+    welfare_df.to_csv(output_dir / "welfare_comparison.csv", index=False)
 
-    generated = []
-    generated.append(plot_discount_curves(output_dir, baseline_params.beta, baseline_params.delta))
-    generated.append(plot_beta_sweep(output_dir, sweep_rows))
-    generated.append(plot_reversal_region(output_dir, region_rows, beta_grid, delta_grid))
-
-    generate_report(output_dir, baseline_params, sweep_rows, welfare_rows, plots_generated=all(generated))
+    plot_discount_curves(output_dir, baseline_params.beta, baseline_params.delta)
+    plot_beta_sweep(output_dir, sweep_df)
+    plot_reversal_region(output_dir, region_df, beta_grid, delta_grid)
+    generate_report(output_dir, baseline_params, sweep_df, welfare_df)
 
 
 if __name__ == "__main__":
